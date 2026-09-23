@@ -1,0 +1,88 @@
+workflows:
+  ios-workflow:
+    name: Capnography iOS
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    integrations:
+      # Name of the App Store Connect API key integration you create in
+      # Codemagic > Teams > Integrations > App Store Connect. The name here
+      # must match exactly what you name it there.
+      app_store_connect: codemagic_asc_api_key
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+      ios_signing:
+        # ad_hoc: signs for devices you register with Apple, no App Store
+        #         Connect app record needed -- simplest way to get a
+        #         installable .ipa for your own iPhone/iPad while testing.
+        # app_store: required later if you want to publish via TestFlight
+        #         or the App Store -- switch this once you're ready.
+        distribution_type: ad_hoc
+        bundle_identifier: com.example.capnographyCo2
+      vars:
+        BUNDLE_ID: "com.example.capnographyCo2"
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: main
+          include: true
+      cancel_previous_builds: true
+    scripts:
+      - name: Set up code signing (fetches/creates the right cert + profile automatically)
+        script: xcode-project use-profiles
+      - name: Get Flutter packages
+        script: flutter pub get
+      - name: Install CocoaPods dependencies
+        script: |
+          find . -name "Podfile" -maxdepth 2 -execdir pod install \;
+      - name: Flutter build ipa
+        script: |
+          flutter build ipa --release \
+            --export-options-plist=/Users/builder/export_options.plist
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      email:
+        recipients:
+          - jiangnianyu1994@gmail.com
+        notify:
+          success: true
+          failure: true
+      # Uncomment once distribution_type above is switched to app_store and
+      # you have an App Store Connect app record for the bundle ID:
+      # app_store_connect:
+      #   auth: integration
+      #   submit_to_testflight: true
+
+  android-workflow:
+    name: Capnography Android
+    instance_type: linux_x2
+    max_build_duration: 30
+    environment:
+      flutter: stable
+      android_signing:
+        # Optional: add a keystore reference in Codemagic > Code signing
+        # identities if you want a properly signed release APK. Without
+        # this, the debug-signed build.gradle.kts config already in the
+        # repo still produces an installable (debug-signed) APK.
+        - capnography_keystore
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: main
+          include: true
+    scripts:
+      - name: Get Flutter packages
+        script: flutter pub get
+      - name: Build APK
+        script: flutter build apk --release
+    artifacts:
+      - build/app/outputs/**/*.apk
+    publishing:
+      email:
+        recipients:
+          - jiangnianyu1994@gmail.com
