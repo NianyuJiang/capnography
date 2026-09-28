@@ -16,17 +16,23 @@ import 'device_session.dart';
 //
 //  1) Virtual ESP32 (test rig)
 //     • Packet: 24 bytes plaintext = 6 × float32 little-endian
-//     • float layout: [phase_diff, mag_ratio, pCO2_ratio, temp, pd_405, pd_470]
+//     • float layout: [breath_flag, mic_rms, pCO2_ratio, temp, pd_405, pd_470]
 //
 //  2) Real NICU_MINI_BLE device
 //     • Packet: 32 bytes ciphertext (AES-128 ECB + PKCS#7 padding)
 //     • Decrypts to: 24 bytes plaintext = 6 × float32 little-endian
-//     • float layout: [phase_diff_avg, mag_ratio, pCO2_ratio, temperature,
+//     • float layout: [breath_flag, mic_rms, pCO2_ratio, temperature,
 //                      PD_405_mean, PD_470_mean]
 //
-//  In both cases pCO2 is the 3rd float (index 2).
-//  To change this later, edit kCo2FloatIndex only.
+//  pCO2 is the 3rd float (index 2). breath_flag (index 0 -- 1.0 = breath,
+//  0.0 = no breath) and mic_rms (index 1 -- the on-device smoothed mic RMS
+//  value the firmware's auto-threshold detector compares against) used to
+//  be unused phase_diff/mag_ratio placeholders; the firmware now sends
+//  real values in both, consumed here for the mic RMS / breath waveform.
+//  To change any of these later, edit the matching kXFloatIndex only.
 // ══════════════════════════════════════════════════════════════════════════
+const int kBreathFlagFloatIndex = 0;
+const int kRmsFloatIndex = 1;
 const int kCo2FloatIndex = 2;
 const double kCo2MinY = 0.0;
 const double kCo2MaxY = 8.0;
@@ -316,14 +322,25 @@ class BleManager {
       return;
     }
 
-    // ── Step 3: parse the float at kCo2FloatIndex ───────────────────
+    // ── Step 3: parse pCO2, breath_flag, and mic_rms ────────────────
     try {
       final view = ByteData.sublistView(payload);
       final co2 = view
           .getFloat32(kCo2FloatIndex * 4, Endian.little)
           .clamp(0.0, 50.0);
+      final breathFlagRaw =
+          view.getFloat32(kBreathFlagFloatIndex * 4, Endian.little);
+      final rms = view.getFloat32(kRmsFloatIndex * 4, Endian.little);
+      final isBreath = breathFlagRaw >= 0.5;
+
       session.addSample(co2);
-      _sampleCtrl.add(SampleEvent(session: session, co2: co2));
+      session.addRmsSample(rms, isBreath);
+      _sampleCtrl.add(SampleEvent(
+        session: session,
+        co2: co2,
+        rms: rms,
+        breath: isBreath,
+      ));
     } catch (e) {
       debugPrint('[BLE:${session.mac}] parse error: $e');
     }
@@ -365,5 +382,12 @@ class BleManager {
 class SampleEvent {
   final DeviceSession session;
   final double co2;
-  const SampleEvent({required this.session, required this.co2});
+  final double rms;
+  final bool breath;
+  const SampleEvent({
+    required this.session,
+    required this.co2,
+    required this.rms,
+    required this.breath,
+  });
 }

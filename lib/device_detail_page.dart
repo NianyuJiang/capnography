@@ -44,8 +44,20 @@ class DeviceDetailPage extends StatelessWidget {
                     _BigReading(session: session, tm: tm, accent: accent),
                     const SizedBox(height: 18),
                     Expanded(
-                      child:
-                          _FullWaveform(session: session, tm: tm, accent: accent),
+                      child: Column(
+                        children: [
+                          Expanded(
+                            flex: 3,
+                            child: _FullWaveform(
+                                session: session, tm: tm, accent: accent),
+                          ),
+                          const SizedBox(height: 12),
+                          Expanded(
+                            flex: 2,
+                            child: _RmsBreathWaveform(session: session, tm: tm),
+                          ),
+                        ],
+                      ),
                     ),
                     const SizedBox(height: 18),
                     _StatsRow(session: session, tm: tm, accent: accent),
@@ -405,6 +417,169 @@ class _FullWaveform extends StatelessWidget {
         ),
         duration: Duration.zero,
       ),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  Mic RMS waveform, colored by the on-device breath_flag: blue while no
+//  breath is detected, red for the stretch the firmware flagged as a
+//  breath. Gaps between real BLE samples are already backfilled with
+//  interpolated points in DeviceSession.addRmsSample, so this just needs
+//  to split the run into same-color segments and draw each with a curved
+//  line -- the interpolation plus the curve is what keeps it "smooth"
+//  instead of a stair-step even though the firmware only notifies every
+//  ~200ms during warm-up (or on breath edges / a 10s heartbeat after).
+// ══════════════════════════════════════════════════════════════════════════
+class _RmsBreathWaveform extends StatelessWidget {
+  final DeviceSession session;
+  final ThemeManager tm;
+  const _RmsBreathWaveform({required this.session, required this.tm});
+
+  @override
+  Widget build(BuildContext context) {
+    final pts = session.rmsPoints.toList();
+    final flags = session.rmsBreathFlags.toList();
+    final borderTone = session.currentBreath ? ThemeManager.redChart : ThemeManager.blue;
+
+    double maxY = 0.0;
+    for (final p in pts) {
+      if (p.y > maxY) maxY = p.y;
+    }
+    final rangeMaxY = maxY <= 0 ? 1.0 : maxY * 1.2;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(6, 12, 16, 10),
+      decoration: BoxDecoration(
+        color: tm.surface,
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: borderTone.withValues(alpha: 0.25)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(
+                'MIC RMS',
+                style: TextStyle(
+                  color: tm.textSub,
+                  fontSize: 10,
+                  letterSpacing: 2,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const Spacer(),
+              _LegendDot(color: ThemeManager.blue, label: 'quiet'),
+              const SizedBox(width: 12),
+              _LegendDot(color: ThemeManager.redChart, label: 'breath'),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Expanded(
+            child: pts.length < 2
+                ? Center(
+                    child: Text(
+                      'Waiting for mic data…',
+                      style: TextStyle(color: tm.textSub, fontSize: 11),
+                    ),
+                  )
+                : LineChart(
+                    LineChartData(
+                      minY: 0.0,
+                      maxY: rangeMaxY,
+                      clipData: const FlClipData.all(),
+                      lineTouchData: const LineTouchData(enabled: false),
+                      gridData: FlGridData(
+                        show: true,
+                        drawVerticalLine: false,
+                        horizontalInterval: rangeMaxY / 3,
+                        getDrawingHorizontalLine: (_) => FlLine(
+                          color: tm.border,
+                          strokeWidth: 0.5,
+                          dashArray: const [3, 6],
+                        ),
+                      ),
+                      borderData: FlBorderData(show: false),
+                      titlesData: const FlTitlesData(
+                        topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                        rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                        bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                        leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                      ),
+                      lineBarsData: _buildSegments(pts, flags),
+                    ),
+                    duration: Duration.zero,
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Splits [pts]/[flags] into contiguous same-color runs. Each segment
+  /// (after the first) also includes the last point of the previous
+  /// segment as its own first point, so the drawn line has no visible gap
+  /// at a blue/red transition even though it's rendered as separate
+  /// LineChartBarData objects.
+  List<LineChartBarData> _buildSegments(List<FlSpot> pts, List<bool> flags) {
+    final segments = <LineChartBarData>[];
+    int start = 0;
+    for (int i = 1; i <= pts.length; i++) {
+      final atBoundary = i == pts.length || flags[i] != flags[start];
+      if (atBoundary) {
+        final segSpots = <FlSpot>[
+          if (start > 0) pts[start - 1],
+          ...pts.sublist(start, i),
+        ];
+        segments.add(_lineFor(segSpots, flags[start]));
+        start = i;
+      }
+    }
+    return segments;
+  }
+
+  LineChartBarData _lineFor(List<FlSpot> spots, bool breath) {
+    final color = breath ? ThemeManager.redChart : ThemeManager.blue;
+    return LineChartBarData(
+      spots: spots,
+      isCurved: true,
+      preventCurveOverShooting: true,
+      curveSmoothness: 0.2,
+      color: color,
+      barWidth: 2.2,
+      isStrokeCapRound: true,
+      dotData: const FlDotData(show: false),
+    );
+  }
+}
+
+class _LegendDot extends StatelessWidget {
+  final Color color;
+  final String label;
+  const _LegendDot({required this.color, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 7,
+          height: 7,
+          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+        ),
+        const SizedBox(width: 4),
+        Text(
+          label,
+          style: TextStyle(
+            color: color.withValues(alpha: 0.9),
+            fontSize: 9,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
     );
   }
 }

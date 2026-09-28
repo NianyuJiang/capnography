@@ -32,6 +32,7 @@ class ThemeManager {
 
   // ── Brand accents (shared by both modes) ────────────────────────────
   static const Color cyan     = Color(0xFF00D4FF);
+  static const Color blue     = Color(0xFF3B82F6);
   static const Color green    = Color(0xFF00C96E);
   static const Color red      = Color(0xFFFF4D4D);
   static const Color orange   = Color(0xFFFF8C00);

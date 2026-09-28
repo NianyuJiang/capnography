@@ -46,6 +46,28 @@ class DeviceSession {
   static const double _hi = 0.5;
   static const double _lo = 0.3;
 
+  // ── Mic RMS / on-device breath_flag waveform ──
+  // x = seconds since connect, so gaps between BLE notifies (the firmware
+  // only sends a new sample every ~200ms during warm-up, and on breath
+  // edges / a 10s idle heartbeat afterward) show as real time gaps rather
+  // than being squashed into a fixed per-sample index like [points] above.
+  static const int maxRmsPoints = 400;
+  // When a gap between two real samples is worth filling, insert one
+  // linearly-interpolated point roughly every _rmsInterpStepSec of real
+  // time between them (capped) so the line reads as a continuous trace
+  // instead of jumping straight from one sample to the next.
+  static const double _rmsInterpStepSec = 0.15;
+  static const int _rmsInterpMaxFill = 80;
+
+  final Queue<FlSpot> rmsPoints = Queue<FlSpot>();
+  final Queue<bool> rmsBreathFlags = Queue<bool>(); // parallel to rmsPoints
+  double currentRms = 0.0;
+  bool currentBreath = false;
+
+  double? _lastRmsT;
+  double? _lastRmsValue;
+  bool _lastBreathFlag = false;
+
   // ── Session timing ──
   final DateTime connectedAt = DateTime.now();
   final ValueNotifier<String> elapsedNotifier = ValueNotifier('00:00:00');
@@ -105,6 +127,58 @@ class DeviceSession {
     points.add(FlSpot(_x++, co2));
     if (points.length > maxPoints) points.removeFirst();
     tick.value++;
+  }
+
+  double get _elapsedSec =>
+      DateTime.now().difference(connectedAt).inMilliseconds / 1000.0;
+
+  /// Process a new mic RMS + breath_flag sample from this device.
+  ///
+  /// If real samples arrive far apart (the firmware only notifies on a
+  /// breath edge or a slow idle heartbeat once past warm-up), the gap since
+  /// the previous real sample is backfilled with linearly-interpolated
+  /// points so the plotted line doesn't visibly jump. The breath_flag
+  /// itself is never interpolated -- it's a discrete on-device decision, so
+  /// backfilled points carry whatever flag was active *before* this new
+  /// sample, and the color only switches at the real sample where the
+  /// firmware actually reported the change.
+  void addRmsSample(double rms, bool breath) {
+    final t = _elapsedSec;
+
+    if (_lastRmsT != null && _lastRmsValue != null) {
+      final gap = t - _lastRmsT!;
+      if (gap > _rmsInterpStepSec * 1.5) {
+        final fillCount = ((gap / _rmsInterpStepSec).floor() - 1)
+            .clamp(0, _rmsInterpMaxFill)
+            .toInt();
+        for (int i = 1; i <= fillCount; i++) {
+          final frac = i / (fillCount + 1);
+          _pushRmsPoint(
+            _lastRmsT! + gap * frac,
+            _lastRmsValue! + (rms - _lastRmsValue!) * frac,
+            _lastBreathFlag,
+          );
+        }
+      }
+    }
+
+    _pushRmsPoint(t, rms, breath);
+
+    _lastRmsT = t;
+    _lastRmsValue = rms;
+    _lastBreathFlag = breath;
+    currentRms = rms;
+    currentBreath = breath;
+    tick.value++;
+  }
+
+  void _pushRmsPoint(double t, double value, bool breath) {
+    rmsPoints.add(FlSpot(t, value));
+    rmsBreathFlags.add(breath);
+    if (rmsPoints.length > maxRmsPoints) {
+      rmsPoints.removeFirst();
+      rmsBreathFlags.removeFirst();
+    }
   }
 
   void resetStats() {
