@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -83,6 +85,21 @@ class _BlePageState extends State<BlePage> {
   }
 
   Future<bool> _requestPermissions() async {
+    // Permission.bluetoothScan / bluetoothConnect are Android 12+ split
+    // permissions with no iOS equivalent -- permission_handler's iOS side
+    // doesn't implement them at all, so they report `.denied` forever on
+    // iOS no matter what the user approves (this is a known upstream
+    // limitation, see Baseflow/flutter-permission-handler#1418). Core
+    // Bluetooth scanning itself works fine on iOS regardless (gated only
+    // by NSBluetoothAlwaysUsageDescription in Info.plist) -- it was only
+    // this app-level permission *gate* that could never pass, hiding scan
+    // results the OS had already found. On iOS, check Permission.bluetooth
+    // instead, which the plugin does map to Core Bluetooth's authorization.
+    if (Platform.isIOS) {
+      final status = await Permission.bluetooth.request();
+      return status.isGranted;
+    }
+
     final statuses = await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
