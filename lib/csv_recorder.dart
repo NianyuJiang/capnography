@@ -1,11 +1,14 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'backup_store.dart';
+import 'ble_history_sync.dart';
 import 'ble_manager.dart';
+import 'device_names.dart';
 import 'device_session.dart';
 import 'session_metadata.dart';
 
@@ -32,6 +35,51 @@ class CsvRecorder {
   StreamSubscription? _sessionsSub;
 
   bool _initialized = false;
+
+  // ── "Continue recording" requests (see connect_flow.dart) ─────────────
+  final Map<String, File> _pendingResume = {}; // keyed by MAC / device id
+  void markPendingResume(String mac, File previous) =>
+      _pendingResume[mac] = previous;
+  void clearPendingResume(String mac) => _pendingResume.remove(mac);
+
+  /// Newest finished recording whose `mac,` header line equals [mac]
+  /// (newest by its `start_iso,` header), or null.
+  static Future<File?> mostRecentRecordingForMac(String mac) async {
+    try {
+      final dir = await _recordingsDir();
+      File? best;
+      DateTime? bestStart;
+      for (final f in dir.listSync().whereType<File>()) {
+        if (!f.path.endsWith('.csv') || f.path.endsWith('__pending.csv')) {
+          continue;
+        }
+        final head = await f
+            .openRead()
+            .transform(utf8.decoder)
+            .transform(const LineSplitter())
+            .take(14)
+            .toList();
+        String? fileMac;
+        DateTime? start;
+        for (final l in head) {
+          if (l.startsWith('mac,')) fileMac = l.substring(4).trim();
+          if (l.startsWith('start_iso,')) {
+            start = DateTime.tryParse(l.substring(10).trim());
+          }
+        }
+        if (fileMac == mac &&
+            start != null &&
+            (bestStart == null || start.isAfter(bestStart))) {
+          best = f;
+          bestStart = start;
+        }
+      }
+      return best;
+    } catch (e) {
+      debugPrint('[CSV] mostRecentRecordingForMac error: $e');
+      return null;
+    }
+  }
 
   // ── Lifecycle ─────────────────────────────────────────────────────────
   void init() {
@@ -79,6 +127,12 @@ class CsvRecorder {
 
   // ── Start ─────────────────────────────────────────────────────────────
   Future<void> _start(DeviceSession session) async {
+    // "No → Continue": reopen the device's last recording and backfill it.
+    final resumeFile = _pendingResume.remove(session.mac);
+    if (resumeFile != null && await resumeFile.exists()) {
+      if (await _resume(session, resumeFile)) return;
+      // Could not reopen it → fall through to a fresh recording.
+    }
     try {
       final dir = await _recordingsDir();
       final now = DateTime.now();
@@ -119,6 +173,10 @@ class CsvRecorder {
       // Populate sidecar metadata (title + notes) from QR info
       await _populateSidecar(session, file, now);
 
+      // Fresh recording: whatever the device stored while disconnected
+      // belongs to the previous patient/session -- discard it.
+      unawaited(BleHistorySync.clear(session.historyChar));
+
       debugPrint('[CSV] start ${session.mac} → ${file.path}');
     } catch (e) {
       debugPrint('[CSV] start failed for ${session.mac}: $e');
@@ -147,8 +205,8 @@ class CsvRecorder {
     final noteDev = devName ?? '';
     if (noteDev.isNotEmpty) {
       lines.add('Device: $noteDev');
-    } else if (s.device.platformName.isNotEmpty) {
-      lines.add('Device: ${s.device.platformName}');
+    } else if (bleNameOf(s.device).isNotEmpty) {
+      lines.add('Device: ${bleNameOf(s.device)}');
     }
     final patient = (s.meta['patient'] as String?)?.trim();
     if (patient != null && patient.isNotEmpty) {
@@ -170,18 +228,123 @@ class CsvRecorder {
     }
   }
 
+
+  // ── Resume ("No → Continue") ──────────────────────────────────────────
+  /// Reopens [prev] as this session's recording (elapsed time keeps counting
+  /// from its ORIGINAL start), then pulls the data the device stored in its
+  /// own memory while the phone was away and writes it in first. Live rows
+  /// that arrive meanwhile are held back so the file stays chronological.
+  /// Returns false if the file could not be reopened.
+  Future<bool> _resume(DeviceSession session, File prev) async {
+    try {
+      final oldName = prev.uri.pathSegments.last;
+      final base = oldName.replaceAll('.csv', '');
+      final pendingName = '${base.split('__').first}__pending.csv';
+      final lines = await prev.readAsLines();
+
+      DateTime? start;
+      for (var i = 0; i < lines.length && i < 14; i++) {
+        if (lines[i].startsWith('start_iso,')) {
+          start = DateTime.tryParse(lines[i].substring(10).trim());
+        } else if (lines[i].startsWith('end_iso,')) {
+          lines[i] = 'end_iso,'; // reopened: open-ended again
+        }
+      }
+      if (start == null) return false;
+      await prev.writeAsString('${lines.join('\n')}\n');
+
+      final file = await prev.rename('${prev.parent.path}/$pendingName');
+      await SessionMetadata.instance.rename(oldName, pendingName);
+      final sink = file.openWrite(mode: FileMode.append);
+      final st = _RecState(
+        session: session,
+        file: file,
+        sink: sink,
+        startTime: start,
+      )
+        ..rowCount = 1 // existing file counts as non-empty
+        ..backfilling = true;
+      _states[session.mac] = st;
+      debugPrint('[CSV] resume ${session.mac} → ${file.path}');
+
+      unawaited(_backfill(st));
+      return true;
+    } catch (e) {
+      debugPrint('[CSV] resume failed: $e');
+      return false;
+    }
+  }
+
+  Future<void> _backfill(_RecState st) async {
+    var written = 0;
+    try {
+      final res = await BleHistorySync.sync(st.session.historyChar);
+      if (res == null) {
+        debugPrint('[CSV] backfill: device has no history buffer');
+      } else if (res.records.isEmpty) {
+        debugPrint('[CSV] backfill: nothing stored (${res.endReason})');
+        if (res.complete) await BleHistorySync.clear(st.session.historyChar);
+      } else if (res.anchorWall == null) {
+        // Cannot date the records without the end marker: keep them on the
+        // device so a later "Continue" can retry.
+        debugPrint('[CSV] backfill: no end marker (${res.endReason}) — '
+            '${res.records.length} record(s) NOT written');
+      } else {
+        for (final r in res.records) {
+          final wall = res.wallTimeOf(r)!;
+          final elapsed = wall.difference(st.startTime);
+          if (elapsed.isNegative) continue;
+          st.sink.writeln('${_fmtElapsed(elapsed)},'
+              '${r.pco2.toStringAsFixed(4)},'
+              '${r.rms.toStringAsFixed(2)},${r.breath ? 1 : 0}');
+          st.rowCount++;
+          written++;
+        }
+        await st.sink.flush();
+        if (res.complete) await BleHistorySync.clear(st.session.historyChar);
+        debugPrint('[CSV] backfill: wrote $written row(s) '
+            '(device sent ${res.deviceSent}, dropped ${res.deviceDropped}, '
+            'end: ${res.endReason})');
+      }
+    } catch (e) {
+      debugPrint('[CSV] backfill error: $e');
+    } finally {
+      // Release the live rows that were held back during the sync.
+      st.backfilling = false;
+      try {
+        for (final line in st.heldRows) {
+          st.sink.writeln(line);
+          st.rowCount++;
+        }
+        st.heldRows.clear();
+        await st.sink.flush();
+      } catch (e) {
+        debugPrint('[CSV] flush held rows error: $e');
+      }
+    }
+  }
+
+  static String _fmtElapsed(Duration e) {
+    final h = e.inHours.toString().padLeft(2, '0');
+    final m = (e.inMinutes % 60).toString().padLeft(2, '0');
+    final s = (e.inSeconds % 60).toString().padLeft(2, '0');
+    final ms = (e.inMilliseconds % 1000).toString().padLeft(3, '0');
+    return '$h:$m:$s.$ms';
+  }
+
   // ── Per-sample write ──────────────────────────────────────────────────
   void _onSample(SampleEvent ev) {
     final st = _states[ev.session.mac];
     if (st == null) return;
     final elapsed = DateTime.now().difference(st.startTime);
-    final h = elapsed.inHours.toString().padLeft(2, '0');
-    final m = (elapsed.inMinutes % 60).toString().padLeft(2, '0');
-    final s = (elapsed.inSeconds % 60).toString().padLeft(2, '0');
-    final ms = (elapsed.inMilliseconds % 1000).toString().padLeft(3, '0');
+    final line = '${_fmtElapsed(elapsed)},${ev.co2.toStringAsFixed(4)},'
+        '${ev.rms.toStringAsFixed(2)},${ev.breath ? 1 : 0}';
+    if (st.backfilling) {
+      st.heldRows.add(line); // written right after the backfill, in order
+      return;
+    }
     try {
-      st.sink.writeln('$h:$m:$s.$ms,${ev.co2.toStringAsFixed(4)},'
-          '${ev.rms.toStringAsFixed(2)},${ev.breath ? 1 : 0}');
+      st.sink.writeln(line);
       st.rowCount++;
       // Flush EVERY row: samples arrive ~30 s apart, so the cost is trivial
       // and it guarantees data is on disk even if the app is killed/crashes.
@@ -539,6 +702,8 @@ class _RecState {
   final IOSink sink;
   final DateTime startTime;
   int rowCount = 0;
+  bool backfilling = false;
+  final List<String> heldRows = [];
   _RecState({
     required this.session,
     required this.file,

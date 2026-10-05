@@ -6,6 +6,8 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'ble_manager.dart';
+import 'connect_flow.dart';
+import 'device_names.dart';
 import 'device_session.dart';
 import 'glass.dart';
 import 'scan_qr_page.dart';
@@ -126,7 +128,7 @@ class _BlePageState extends State<BlePage> {
     // it would get from a QR-code connect. This makes the auto-fill of the
     // session title work whether the user scans a QR or taps the device
     // in the Bluetooth list.
-    final advName = device.platformName.trim();
+    final advName = bleNameOf(device);
     final knownName = KnownDevices.instance.nameOf(device.remoteId.str) ?? '';
     final resolvedName = advName.isNotEmpty
         ? advName
@@ -134,6 +136,11 @@ class _BlePageState extends State<BlePage> {
     final meta = <String, dynamic>{
       if (resolvedName.isNotEmpty) 'name': resolvedName,
     };
+
+    // "New patient?" / "Continue recording?" — only asked if this device has
+    // a previous recording (see connect_flow.dart).
+    await maybeShowConnectDialogs(context, mac: device.remoteId.str);
+    if (!mounted) return;
 
     final res = await _ble.connect(device, meta: meta);
     if (!mounted) return;
@@ -688,9 +695,8 @@ class _ScanResultCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final name = result.device.platformName.isEmpty
-        ? 'Unknown Device'
-        : result.device.platformName;
+    final shownName = bleNameOf(result.device);
+    final name = shownName.isEmpty ? 'Unknown Device' : shownName;
     final bars = _rssiBars(result.rssi);
 
     return GestureDetector(

@@ -7,6 +7,8 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 // conflicting names to keep the rest of the codebase safe.
 import 'package:pointycastle/export.dart' hide State, Padding;
 
+import 'ble_history_sync.dart';
+import 'device_names.dart';
 import 'device_session.dart';
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -151,6 +153,7 @@ class BleManager {
     _scanSub?.cancel();
 
     _scanSub = FlutterBluePlus.scanResults.listen((results) {
+      noteScanResults(results); // remember advertised names (see device_names.dart)
       final sorted = List<ScanResult>.from(results)
         ..sort((a, b) => b.rssi.compareTo(a.rssi));
       // Keep only the strongest 50 to avoid UI overload
@@ -218,6 +221,7 @@ class BleManager {
         meta: meta,
       );
       session.notifyChar = char;
+      session.historyChar = BleHistorySync.findHistoryChar(services);
       session.startClock();
 
       session.notifySub = char.lastValueStream.listen((bytes) {
@@ -248,6 +252,8 @@ class BleManager {
       final uuid = svc.uuid.toString().toLowerCase();
       if (_knownServiceUuids.contains(uuid)) {
         for (final ch in svc.characteristics) {
+          // The history-sync characteristic also notifies; never use it for live data.
+          if (ch.uuid.toString().toLowerCase() == kHistorySyncCharUuid) continue;
           if (ch.properties.notify || ch.properties.indicate) {
             debugPrint('[BLE:$mac] Matched known service $uuid');
             return ch;
@@ -261,6 +267,7 @@ class BleManager {
       if (uuid.contains('00805f9b34fb')) continue;
       if (uuid.length <= 8) continue;
       for (final ch in svc.characteristics) {
+        if (ch.uuid.toString().toLowerCase() == kHistorySyncCharUuid) continue;
         if (ch.properties.notify || ch.properties.indicate) {
           debugPrint('[BLE:$mac] Using custom service $uuid');
           return ch;

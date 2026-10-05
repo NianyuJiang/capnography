@@ -16,7 +16,7 @@ devices**, archiving every session as CSV.
 
 > A multi-parameter derivative of this application — tracking pO₂, pCO₂, and
 > temperature simultaneously — is maintained alongside it at
-> `../../Gas-Monitor/`. Both share the same layered architecture, storage
+> `../../NICU-App/`. Both share the same layered architecture, storage
 > engine, and UI system.
 
 ---

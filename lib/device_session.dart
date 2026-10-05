@@ -10,6 +10,8 @@ import 'package:flutter/foundation.dart';
 import 'package:fl_chart/fl_chart.dart' show FlSpot;
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
+import 'device_names.dart';
+
 // ══════════════════════════════════════════════════════════════════════════
 //  DeviceSession
 //  ─────────────────────────────────────────────────────────────────────────
@@ -33,6 +35,7 @@ class DeviceSession {
 
   // ── BLE wiring ──
   BluetoothCharacteristic? notifyChar;
+  BluetoothCharacteristic? historyChar; // device's flash-history sync char (null on old firmware)
   StreamSubscription? notifySub;
   StreamSubscription? stateSub;
 
@@ -90,7 +93,7 @@ class DeviceSession {
   String get displayName {
     final fromMeta = (meta['name'] as String?)?.trim();
     if (fromMeta != null && fromMeta.isNotEmpty) return fromMeta;
-    final fromBle = device.platformName.trim();
+    final fromBle = bleNameOf(device);
     if (fromBle.isNotEmpty) return fromBle;
     return 'Device #$slot';
   }
