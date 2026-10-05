@@ -429,7 +429,7 @@ class _FullWaveform extends StatelessWidget {
 //  to split the run into same-color segments and draw each with a curved
 //  line -- the interpolation plus the curve is what keeps it "smooth"
 //  instead of a stair-step even though the firmware only notifies every
-//  ~200ms during warm-up (or on breath edges / a 10s heartbeat after).
+//  ~5 Hz (every 200 ms).
 // ══════════════════════════════════════════════════════════════════════════
 class _RmsBreathWaveform extends StatelessWidget {
   final DeviceSession session;

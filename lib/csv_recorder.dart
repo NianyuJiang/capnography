@@ -107,7 +107,7 @@ class CsvRecorder {
         }
       }
       sink.writeln('---');
-      sink.writeln('elapsed,co2_percent');
+      sink.writeln('elapsed,co2_percent,mic_rms,breath_flag');
 
       _states[session.mac] = _RecState(
         session: session,
@@ -180,7 +180,8 @@ class CsvRecorder {
     final s = (elapsed.inSeconds % 60).toString().padLeft(2, '0');
     final ms = (elapsed.inMilliseconds % 1000).toString().padLeft(3, '0');
     try {
-      st.sink.writeln('$h:$m:$s.$ms,${ev.co2.toStringAsFixed(4)}');
+      st.sink.writeln('$h:$m:$s.$ms,${ev.co2.toStringAsFixed(4)},'
+          '${ev.rms.toStringAsFixed(2)},${ev.breath ? 1 : 0}');
       st.rowCount++;
       // Flush EVERY row: samples arrive ~30 s apart, so the cost is trivial
       // and it guarantees data is on disk even if the app is killed/crashes.
@@ -357,7 +358,12 @@ class CsvRecorder {
           if (parts.length < 2) continue;
           final co2 = double.tryParse(parts[1]);
           if (co2 == null) continue;
-          samples.add(CsvSample(elapsedText: parts[0], co2: co2));
+          samples.add(CsvSample(
+            elapsedText: parts[0],
+            co2: co2,
+            rms: parts.length > 2 ? double.tryParse(parts[2]) : null,
+            breath: parts.length > 3 ? parts[3].trim() == '1' : null,
+          ));
         }
       }
       return RecordingData(start: start, end: end, samples: samples);
@@ -623,7 +629,10 @@ class RecordingInfo {
 class CsvSample {
   final String elapsedText;
   final double co2;
-  const CsvSample({required this.elapsedText, required this.co2});
+  final double? rms; // null in old 2-column files
+  final bool? breath;
+  const CsvSample(
+      {required this.elapsedText, required this.co2, this.rms, this.breath});
 }
 
 class RecordingData {

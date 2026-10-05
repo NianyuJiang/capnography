@@ -325,16 +325,25 @@ class BleManager {
     // ── Step 3: parse pCO2, breath_flag, and mic_rms ────────────────
     try {
       final view = ByteData.sublistView(payload);
-      final co2 = view
-          .getFloat32(kCo2FloatIndex * 4, Endian.little)
-          .clamp(0.0, 50.0);
-      final breathFlagRaw =
+      final co2Raw = view.getFloat32(kCo2FloatIndex * 4, Endian.little);
+      final flagRaw =
           view.getFloat32(kBreathFlagFloatIndex * 4, Endian.little);
-      final rms = view.getFloat32(kRmsFloatIndex * 4, Endian.little);
-      final isBreath = breathFlagRaw >= 0.5;
+      final rmsRaw = view.getFloat32(kRmsFloatIndex * 4, Endian.little);
 
-      session.addSample(co2);
-      session.addRmsSample(rms, isBreath);
+      // NaN/Inf guard: skip a corrupt part and hold the last valid value.
+      final co2Ok = co2Raw.isFinite;
+      final rmsOk = rmsRaw.isFinite && flagRaw.isFinite;
+      if (!co2Ok && !rmsOk) {
+        debugPrint('[BLE] dropped non-finite packet');
+        return;
+      }
+      final co2 =
+          co2Ok ? co2Raw.clamp(0.0, 50.0).toDouble() : session.currentCo2;
+      final rms = rmsOk ? rmsRaw : session.currentRms;
+      final isBreath = rmsOk ? flagRaw >= 0.5 : session.currentBreath;
+
+      if (co2Ok) session.addSample(co2);
+      if (rmsOk) session.addRmsSample(rms, isBreath);
       _sampleCtrl.add(SampleEvent(
         session: session,
         co2: co2,

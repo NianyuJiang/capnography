@@ -42,14 +42,17 @@ class DeviceSession {
   double peakCo2 = 0.0;
   int breathCount = 0;
   double _x = 0.0;
-  bool _aboveThreshold = false;
-  static const double _hi = 0.5;
-  static const double _lo = 0.3;
+
+  // Breath counting is driven by the firmware's breath_flag (rising edges),
+  // not by the pCO2 value. [_breathStarts] holds recent breath-start times
+  // (seconds since connect) for the rolling rate.
+  static const int _rateWindowBreaths = 8;
+  static const double _rateStaleSec = 15.0;
+  final Queue<double> _breathStarts = Queue<double>();
 
   // ── Mic RMS / on-device breath_flag waveform ──
   // x = seconds since connect, so gaps between BLE notifies (the firmware
-  // only sends a new sample every ~200ms during warm-up, and on breath
-  // edges / a 10s idle heartbeat afterward) show as real time gaps rather
+  // sends flag+RMS at ~5 Hz) show as real time gaps rather
   // than being squashed into a fixed per-sample index like [points] above.
   static const int maxRmsPoints = 400;
   // When a gap between two real samples is worth filling, insert one
@@ -117,13 +120,6 @@ class DeviceSession {
     currentCo2 = co2;
     if (co2 > peakCo2) peakCo2 = co2;
 
-    if (!_aboveThreshold && co2 >= _hi) {
-      _aboveThreshold = true;
-      breathCount++;
-    } else if (_aboveThreshold && co2 < _lo) {
-      _aboveThreshold = false;
-    }
-
     points.add(FlSpot(_x++, co2));
     if (points.length > maxPoints) points.removeFirst();
     tick.value++;
@@ -134,8 +130,7 @@ class DeviceSession {
 
   /// Process a new mic RMS + breath_flag sample from this device.
   ///
-  /// If real samples arrive far apart (the firmware only notifies on a
-  /// breath edge or a slow idle heartbeat once past warm-up), the gap since
+  /// If real samples arrive far apart (e.g. a dropped notify), the gap since
   /// the previous real sample is backfilled with linearly-interpolated
   /// points so the plotted line doesn't visibly jump. The breath_flag
   /// itself is never interpolated -- it's a discrete on-device decision, so
@@ -164,6 +159,15 @@ class DeviceSession {
 
     _pushRmsPoint(t, rms, breath);
 
+    // Rising edge of the on-device breath_flag = one breath.
+    if (breath && !_lastBreathFlag) {
+      breathCount++;
+      _breathStarts.add(t);
+      while (_breathStarts.length > _rateWindowBreaths) {
+        _breathStarts.removeFirst();
+      }
+    }
+
     _lastRmsT = t;
     _lastRmsValue = rms;
     _lastBreathFlag = breath;
@@ -184,14 +188,18 @@ class DeviceSession {
   void resetStats() {
     peakCo2 = 0;
     breathCount = 0;
-    _aboveThreshold = false;
+    _breathStarts.clear();
     tick.value++;
   }
 
   double get breathRate {
-    final secs = DateTime.now().difference(connectedAt).inSeconds;
-    if (secs < 5) return 0;
-    return (breathCount * 60) / secs;
+    // Rolling rate over the last few breaths (breaths/min). 0 if fewer than
+    // two breaths, or if the last breath was a while ago (apnea / idle).
+    if (_breathStarts.length < 2) return 0;
+    if (_elapsedSec - _breathStarts.last > _rateStaleSec) return 0;
+    final span = _breathStarts.last - _breathStarts.first;
+    if (span <= 0) return 0;
+    return (_breathStarts.length - 1) * 60.0 / span;
   }
 
   Future<void> dispose() async {
