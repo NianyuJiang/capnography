@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 
+import 'auto_reconnect.dart';
 import 'ble_manager.dart';
+import 'device_info.dart';
 import 'device_session.dart';
 import 'glass.dart';
 import 'theme_manager.dart';
@@ -61,6 +63,8 @@ class DeviceDetailPage extends StatelessWidget {
                     ),
                     const SizedBox(height: 18),
                     _StatsRow(session: session, tm: tm, accent: accent),
+                    const SizedBox(height: 10),
+                    _DeviceStatusRow(session: session, tm: tm),
                   ],
                 ),
               ),
@@ -685,6 +689,154 @@ class _Stat extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  Device status: detector calibration + health counters from the device's
+//  info characteristic, and the per-device Auto re-connect switch.
+// ══════════════════════════════════════════════════════════════════════════
+class _DeviceStatusRow extends StatelessWidget {
+  final DeviceSession session;
+  final ThemeManager tm;
+  const _DeviceStatusRow({required this.session, required this.tm});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(child: _DeviceHealthCard(session: session, tm: tm)),
+        const SizedBox(width: 8),
+        Expanded(child: _AutoReconnectSwitch(session: session, tm: tm)),
+      ],
+    );
+  }
+}
+
+class _DeviceHealthCard extends StatelessWidget {
+  final DeviceSession session;
+  final ThemeManager tm;
+  const _DeviceHealthCard({required this.session, required this.tm});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<DeviceInfo?>(
+      valueListenable: session.info,
+      builder: (_, info, __) {
+        String title;
+        String sub;
+        Color color;
+        if (session.infoChar == null) {
+          title = 'Device status';
+          sub = 'not in this firmware';
+          color = tm.textSub;
+        } else if (info == null) {
+          title = 'Device status';
+          sub = 'reading…';
+          color = tm.textSub;
+        } else if (info.hasProblem) {
+          title = 'Device warning';
+          final parts = <String>[];
+          if (info.flashErrors > 0) parts.add('flash errors ${info.flashErrors}');
+          if (info.notifyErrors > 0) parts.add('notify errors ${info.notifyErrors}');
+          if (!info.historyReady) parts.add('no history buffer');
+          sub = parts.join(' · ');
+          color = ThemeManager.orange;
+        } else if (!info.calibrated) {
+          title = 'Calibrating';
+          sub = 'learning breath level…';
+          color = ThemeManager.cyan;
+        } else {
+          title = 'Device OK';
+          sub = 'threshold ${info.threshold.toStringAsFixed(1)} · '
+              '${info.histRecords} stored';
+          color = ThemeManager.green;
+        }
+        return GlassCard(
+          borderRadius: 14,
+          elevated: false,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Row(
+            children: [
+              Icon(
+                info != null && info.hasProblem
+                    ? Icons.warning_amber_rounded
+                    : Icons.monitor_heart_outlined,
+                color: color,
+                size: 20,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(title,
+                        style: TextStyle(
+                            color: tm.textPrimary,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600)),
+                    Text(sub,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: tm.textSub, fontSize: 10)),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _AutoReconnectSwitch extends StatelessWidget {
+  final DeviceSession session;
+  final ThemeManager tm;
+  const _AutoReconnectSwitch({required this.session, required this.tm});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<Set<String>>(
+      valueListenable: AutoReconnect.instance.enabledMacs,
+      builder: (_, __, ___) {
+        final on = AutoReconnect.instance.isEnabled(session.mac);
+        return GlassCard(
+          borderRadius: 14,
+          elevated: false,
+          padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+          child: Row(
+            children: [
+              Icon(Icons.autorenew_rounded,
+                  color: on ? ThemeManager.cyan : tm.textSub, size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text('Auto re-connect',
+                        style: TextStyle(
+                            color: tm.textPrimary,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600)),
+                    Text(on ? 'ON · retries 10 min' : 'off',
+                        style: TextStyle(color: tm.textSub, fontSize: 10)),
+                  ],
+                ),
+              ),
+              Switch(
+                value: on,
+                activeColor: ThemeManager.cyan,
+                onChanged: (v) =>
+                    AutoReconnect.instance.setEnabled(session.mac, v),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }

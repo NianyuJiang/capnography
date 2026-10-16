@@ -36,6 +36,73 @@ class CsvRecorder {
 
   bool _initialized = false;
 
+  // ── Serialised session handling ──────────────────────────────────────
+  // Connect/disconnect events are processed one at a time, in order, so a
+  // fast drop + reconnect can never overlap a recording's close with the
+  // next one's start. [waitIdle] resolves once everything queued is done.
+  Future<void> _queue = Future.value();
+  void _enqueue(Future<void> Function() job) {
+    _queue = _queue.then((_) async {
+      try {
+        await job();
+      } catch (e) {
+        debugPrint('[CSV] queued job error: $e');
+      }
+    });
+  }
+
+  Future<void> waitIdle() async {
+    Future<void> t;
+    do {
+      t = _queue;
+      await t;
+    } while (!identical(t, _queue));
+  }
+
+  // ── Notes log ────────────────────────────────────────────────────────
+  Future<void> _noteChain = Future.value();
+  static final DateFormat _noteTime = DateFormat('yyyy-MM-dd HH:mm:ss');
+
+  Future<void> _appendNote(String csvName, String line) {
+    final done = Completer<void>();
+    _noteChain = _noteChain.then((_) async {
+      try {
+        final cur = await SessionMetadata.instance.getNotes(csvName);
+        await SessionMetadata.instance
+            .setNotes(csvName, cur.isEmpty ? line : '$cur\n$line');
+      } catch (e) {
+        debugPrint('[CSV] note error: $e');
+      }
+      done.complete();
+    });
+    return done.future;
+  }
+
+  /// Appends a timestamped line to the notes of [mac]'s current recording.
+  /// Waits (up to ~5 s) for the recording to exist. With [toLatestIfIdle]
+  /// and no live recording it goes to the device's most recent finished
+  /// recording instead. Returns whether the line was written.
+  Future<bool> logEvent(String mac, String text,
+      {DateTime? at, bool toLatestIfIdle = false}) async {
+    final line = '[${_noteTime.format(at ?? DateTime.now())}] $text';
+    for (var i = 0; i < 10; i++) {
+      await waitIdle();
+      final st = _states[mac];
+      if (st != null) {
+        await _appendNote(st.file.uri.pathSegments.last, line);
+        return true;
+      }
+      if (toLatestIfIdle) {
+        final f = await mostRecentRecordingForMac(mac);
+        if (f == null) return false;
+        await _appendNote(f.uri.pathSegments.last, line);
+        return true;
+      }
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
+    return false;
+  }
+
   // ── "Continue recording" requests (see connect_flow.dart) ─────────────
   final Map<String, File> _pendingResume = {}; // keyed by MAC / device id
   void markPendingResume(String mac, File previous) =>
@@ -94,8 +161,8 @@ class CsvRecorder {
     _sampleSub = BleManager.instance.sampleStream.listen(_onSample);
 
     // Watch session add/remove to start & stop recordings automatically
-    _sessionsSub =
-        _seToStream().listen((sessions) => _reconcile(sessions));
+    _sessionsSub = _seToStream()
+        .listen((sessions) => _enqueue(() => _reconcile(sessions)));
   }
 
   // Adapt the ValueNotifier into a stream for the listener
@@ -276,51 +343,83 @@ class CsvRecorder {
   }
 
   Future<void> _backfill(_RecState st) async {
-    var written = 0;
+    final name = st.file.uri.pathSegments.last;
+    String report = '';
     try {
       final res = await BleHistorySync.sync(st.session.historyChar);
-      if (res == null) {
-        debugPrint('[CSV] backfill: device has no history buffer');
+      if (st.closed) {
+        // The recording ended during the sync: nothing was written and the
+        // data stays on the device for the next "Continue".
+        report = '';
+      } else if (res == null) {
+        report = 'Sync: device has no history buffer (older firmware) — '
+            'nothing recovered';
       } else if (res.records.isEmpty) {
-        debugPrint('[CSV] backfill: nothing stored (${res.endReason})');
+        report = 'Sync: the device had no stored records (${res.endReason})'
+            '${res.failure != null ? ', error: ${res.failure}' : ''}';
         if (res.complete) await BleHistorySync.clear(st.session.historyChar);
       } else if (res.anchorWall == null) {
         // Cannot date the records without the end marker: keep them on the
         // device so a later "Continue" can retry.
-        debugPrint('[CSV] backfill: no end marker (${res.endReason}) — '
-            '${res.records.length} record(s) NOT written');
+        report = 'Sync: received ${res.records.length} record(s) but did NOT '
+            'write them — no end marker (${res.endReason}); they stay on the '
+            'device for a later Continue'
+            '${res.failure != null ? ', error: ${res.failure}' : ''}';
       } else {
+        var written = 0, skipped = 0;
+        DateTime? first, last;
         for (final r in res.records) {
           final wall = res.wallTimeOf(r)!;
           final elapsed = wall.difference(st.startTime);
-          if (elapsed.isNegative) continue;
+          if (elapsed.isNegative) {
+            skipped++;
+            continue;
+          }
           st.sink.writeln('${_fmtElapsed(elapsed)},'
               '${r.pco2.toStringAsFixed(4)},'
               '${r.rms.toStringAsFixed(2)},${r.breath ? 1 : 0}');
           st.rowCount++;
           written++;
+          first ??= wall;
+          last = wall;
         }
         await st.sink.flush();
         if (res.complete) await BleHistorySync.clear(st.session.historyChar);
-        debugPrint('[CSV] backfill: wrote $written row(s) '
-            '(device sent ${res.deviceSent}, dropped ${res.deviceDropped}, '
-            'end: ${res.endReason})');
+        final tf = DateFormat('HH:mm:ss');
+        report = 'Sync: wrote $written of ${res.records.length} record(s)'
+            '${first != null ? ' covering ${tf.format(first)}–${tf.format(last!)}' : ''}'
+            '; device sent ${res.deviceSent ?? '?'}, dropped '
+            '${res.deviceDropped ?? '?'}'
+            '${skipped > 0 ? ', $skipped older than this recording' : ''}'
+            '${res.duplicates > 0 ? ', ${res.duplicates} duplicate(s) removed' : ''}'
+            '; end: ${res.endReason}'
+            '${res.complete ? '' : ' (INCOMPLETE — device buffer kept)'}'
+            '${res.failure != null ? ', error: ${res.failure}' : ''}';
+        debugPrint('[CSV] backfill: $report');
       }
     } catch (e) {
       debugPrint('[CSV] backfill error: $e');
+      report = 'Sync: failed — $e';
     } finally {
-      // Release the live rows that were held back during the sync.
+      // Release the live rows that were held back during the sync
+      // (unless _stop already wrote them).
       st.backfilling = false;
-      try {
-        for (final line in st.heldRows) {
-          st.sink.writeln(line);
-          st.rowCount++;
+      if (!st.closed) {
+        try {
+          for (final line in st.heldRows) {
+            st.sink.writeln(line);
+            st.rowCount++;
+          }
+          st.heldRows.clear();
+          await st.sink.flush();
+        } catch (e) {
+          debugPrint('[CSV] flush held rows error: $e');
         }
-        st.heldRows.clear();
-        await st.sink.flush();
-      } catch (e) {
-        debugPrint('[CSV] flush held rows error: $e');
       }
+    }
+    if (report.isNotEmpty && !st.closed) {
+      await _appendNote(
+          name, '[${_noteTime.format(DateTime.now())}] $report');
     }
   }
 
@@ -359,6 +458,19 @@ class CsvRecorder {
     final st = _states.remove(mac);
     if (st == null) return;
     final endTime = DateTime.now();
+
+    // Ended while a backfill was still running: the live rows held back for
+    // it would otherwise be lost. Write them now and tell _backfill to stop.
+    st.closed = true;
+    try {
+      for (final line in st.heldRows) {
+        st.sink.writeln(line);
+        st.rowCount++;
+      }
+      st.heldRows.clear();
+    } catch (e) {
+      debugPrint('[CSV] flush held rows (stop) error: $e');
+    }
 
     try {
       await st.sink.flush();
@@ -703,6 +815,7 @@ class _RecState {
   final DateTime startTime;
   int rowCount = 0;
   bool backfilling = false;
+  bool closed = false; // set by _stop
   final List<String> heldRows = [];
   _RecState({
     required this.session,

@@ -9,9 +9,11 @@
 //  expansion — tell me and I'll write the 4-channel version.
 // ════════════════════════════════════════════════════════════════════════
 import 'dart:ui';
+import 'package:intl/intl.dart';
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 
+import 'auto_reconnect.dart';
 import 'ble_manager.dart';
 import 'device_session.dart';
 import 'device_detail_page.dart';
@@ -34,6 +36,7 @@ class MonitorPage extends StatelessWidget {
             children: [
               _Header(),
               const SizedBox(height: 16),
+              const _ReconnectBanner(),
               Expanded(
                 child: ValueListenableBuilder<List<DeviceSession>>(
                   valueListenable: BleManager.instance.sessionsNotifier,
@@ -567,6 +570,91 @@ class _MiniStat extends StatelessWidget {
           style: TextStyle(color: tm.textSub, fontSize: 10),
         ),
       ],
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  Auto re-connect banner (see auto_reconnect.dart). Shown while a device
+//  that dropped is being re-connected, or after it was given up on.
+// ══════════════════════════════════════════════════════════════════════════
+class _ReconnectBanner extends StatelessWidget {
+  const _ReconnectBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    final tm = ThemeManager.instance;
+    return ValueListenableBuilder<List<ReconnectAttempt>>(
+      valueListenable: AutoReconnect.instance.attempts,
+      builder: (_, list, __) {
+        if (list.isEmpty) return const SizedBox.shrink();
+        final fmt = DateFormat('HH:mm');
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Column(
+            children: [
+              for (final a in list)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: GlassCard(
+                    borderRadius: 16,
+                    elevated: false,
+                    accent: a.state == ReconnectState.trying
+                        ? ThemeManager.orange
+                        : ThemeManager.red,
+                    padding: const EdgeInsets.fromLTRB(14, 8, 4, 8),
+                    child: Row(
+                      children: [
+                        if (a.state == ReconnectState.trying)
+                          const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(
+                                strokeWidth: 1.8, color: ThemeManager.orange),
+                          )
+                        else
+                          const Icon(Icons.link_off_rounded,
+                              size: 16, color: ThemeManager.red),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            a.state == ReconnectState.trying
+                                ? '${a.label} — connection lost at '
+                                    '${fmt.format(a.lostAt)}. Reconnecting '
+                                    'automatically until '
+                                    '${fmt.format(a.deadline)}'
+                                : '${a.label} — could not re-connect within '
+                                    '10 min. Connect it from the Bluetooth '
+                                    'page.',
+                            style: TextStyle(
+                                color: tm.textPrimary, fontSize: 12),
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () =>
+                              AutoReconnect.instance.cancel(a.mac),
+                          child: Text(
+                            a.state == ReconnectState.trying ? 'STOP' : 'OK',
+                            style: TextStyle(
+                              color: a.state == ReconnectState.trying
+                                  ? ThemeManager.orange
+                                  : tm.textSub,
+                              fontSize: 11,
+                              letterSpacing: 1.5,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
     );
   }
 }

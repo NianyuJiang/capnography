@@ -9,9 +9,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import 'auto_reconnect.dart';
 import 'ble_manager.dart';
 import 'ble_page.dart';
 import 'csv_recorder.dart';
+import 'device_health.dart';
 import 'device_session.dart';
 import 'glass.dart';
 import 'history_page.dart';
@@ -26,6 +28,8 @@ void main() {
     statusBarIconBrightness: Brightness.light,
   ));
   CsvRecorder.instance.init();
+  AutoReconnect.instance.init();
+  DeviceHealth.instance.init();
   runApp(const CapnographyApp());
 }
 

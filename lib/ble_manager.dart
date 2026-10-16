@@ -8,6 +8,7 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:pointycastle/export.dart' hide State, Padding;
 
 import 'ble_history_sync.dart';
+import 'device_info.dart';
 import 'device_names.dart';
 import 'device_session.dart';
 
@@ -125,6 +126,21 @@ class BleManager {
 
   StreamSubscription? _scanSub;
 
+  // ── Unplanned-disconnect reporting (auto re-connect) ──────────────────
+  // Ids being disconnected ON PURPOSE by disconnect()/disconnectAll(): only
+  // drops the app did NOT ask for are reported on [unplannedDrops].
+  final Set<String> _plannedDisconnects = {};
+
+  // Ids with a connect() in progress — stops a background auto re-connect
+  // and a manual tap on the same device from creating two sessions.
+  final Set<String> _connecting = {};
+  final StreamController<DroppedDevice> _dropCtrl =
+      StreamController.broadcast();
+
+  /// Fires once for every connected device whose link drops WITHOUT the app
+  /// having asked for it. A user-pressed disconnect is never reported here.
+  Stream<DroppedDevice> get unplannedDrops => _dropCtrl.stream;
+
   // ─── Accessors ────────────────────────────────────────────────────────
   List<DeviceSession> get sessions => List.unmodifiable(_sessions.values);
   int get sessionCount => _sessions.length;
@@ -176,9 +192,16 @@ class BleManager {
   }
 
   // ─── Connect ──────────────────────────────────────────────────────────
+  //
+  // [standingFor]: instead of a 15 s attempt, place a STANDING connection
+  // request that stays open for up to this long (used by auto re-connect on
+  // iOS: the phone's Bluetooth chip connects by itself the moment the device
+  // advertises, even with the app in the background). Uses
+  // flutter_blue_plus' autoConnect. Cancel early with cancelStandingConnect.
   Future<ConnectResult> connect(
     BluetoothDevice device, {
     Map<String, dynamic>? meta,
+    Duration? standingFor,
   }) async {
     final mac = device.remoteId.str;
 
@@ -189,10 +212,88 @@ class BleManager {
       return ConnectResult.failure(
           'Maximum of $kMaxDevices devices already connected');
     }
-
-    statusNotifier.value = BleStatus.connecting;
+    if (!_connecting.add(mac)) {
+      return ConnectResult.failure('Connection already in progress');
+    }
     try {
-      await device.connect(timeout: const Duration(seconds: 15));
+      return await _connectInner(device, mac, meta, standingFor);
+    } finally {
+      _connecting.remove(mac);
+    }
+  }
+
+  /// Standing connection requests in progress, by id → their cancel signal.
+  final Map<String, Completer<void>> _standingCancels = {};
+
+  /// Cancels a standing connection request (no-op if there is none).
+  void cancelStandingConnect(String mac) {
+    final c = _standingCancels[mac];
+    if (c != null && !c.isCompleted) c.complete();
+  }
+
+  /// Turns off flutter_blue_plus' auto-connect for [device] (left on after a
+  /// standing connect) so iOS does not silently re-connect it after a drop
+  /// when the app is not going to use it. Safe on a disconnected device.
+  void clearAutoConnect(BluetoothDevice device) {
+    if (_sessions.containsKey(device.remoteId.str)) return; // in use
+    if (!device.isAutoConnectEnabled) return;
+    unawaited(device.disconnect(queue: false, timeout: 3).catchError((_) {}));
+  }
+
+  /// Waits for a standing (autoConnect) request to connect. Null once
+  /// connected, or the reason it gave up (timeout / cancelled) — in which
+  /// case the request has been withdrawn.
+  Future<String?> _waitStanding(
+      BluetoothDevice device, String mac, Duration maxWait) async {
+    final cancel = Completer<void>();
+    _standingCancels[mac] = cancel;
+    final done = Completer<String?>();
+    StreamSubscription<BluetoothConnectionState>? sub;
+    Timer? timer;
+    try {
+      await device.connect(autoConnect: true, mtu: null); // returns at once
+      sub = device.connectionState.listen((s) {
+        if (s == BluetoothConnectionState.connected && !done.isCompleted) {
+          done.complete(null);
+        }
+      });
+      timer = Timer(maxWait, () {
+        if (!done.isCompleted) {
+          final m = maxWait.inMinutes;
+          done.complete('The device did not come in range within '
+              '${m >= 1 ? '$m min' : '${maxWait.inSeconds} s'}');
+        }
+      });
+      unawaited(cancel.future.then((_) {
+        if (!done.isCompleted) done.complete('Cancelled');
+      }));
+      final why = await done.future;
+      if (why != null) {
+        unawaited(device.disconnect(queue: false, timeout: 3).catchError((_) {}));
+      }
+      return why;
+    } finally {
+      await sub?.cancel();
+      timer?.cancel();
+      if (identical(_standingCancels[mac], cancel)) _standingCancels.remove(mac);
+    }
+  }
+
+  Future<ConnectResult> _connectInner(
+    BluetoothDevice device,
+    String mac,
+    Map<String, dynamic>? meta,
+    Duration? standingFor,
+  ) async {
+    if (standingFor == null) statusNotifier.value = BleStatus.connecting;
+    try {
+      if (standingFor == null) {
+        await device.connect(timeout: const Duration(seconds: 15));
+      } else {
+        final why = await _waitStanding(device, mac, standingFor);
+        if (why != null) return ConnectResult.failure(why);
+        statusNotifier.value = BleStatus.connecting;
+      }
 
       final services = await device.discoverServices();
       for (final svc in services) {
@@ -222,27 +323,51 @@ class BleManager {
       );
       session.notifyChar = char;
       session.historyChar = BleHistorySync.findHistoryChar(services);
+      session.infoChar = DeviceInfo.findChar(services);
       session.startClock();
 
       session.notifySub = char.lastValueStream.listen((bytes) {
         if (bytes.isNotEmpty) _onBytes(session, bytes);
       });
-
-      // Auto-cleanup when the device drops the link
-      session.stateSub = device.connectionState.listen((state) {
-        if (state == BluetoothConnectionState.disconnected) {
-          _removeSession(mac, notifyStatus: false);
-        }
-      });
+      session.stateSub = _watchLink(session);
 
       _sessions[mac] = session;
       _publishSessions();
       statusNotifier.value = BleStatus.idle;
       return ConnectResult.success(session);
     } catch (e) {
+      // Don't leave a half-open link behind (connected at the OS level but
+      // with no session): the device would stop advertising.
+      try {
+        await device.disconnect();
+      } catch (_) {}
       statusNotifier.value = BleStatus.idle;
       return ConnectResult.failure(e.toString());
     }
+  }
+
+  /// Watches a session's link; when it drops the session ends, reported on
+  /// [unplannedDrops] unless the app asked for it.
+  StreamSubscription<BluetoothConnectionState> _watchLink(
+      DeviceSession session) {
+    final mac = session.mac;
+    return session.device.connectionState.listen((state) {
+      if (state != BluetoothConnectionState.disconnected) return;
+      if (!identical(_sessions[mac], session)) return;
+      if (!_plannedDisconnects.contains(mac)) _emitDrop(session);
+      _removeSession(mac, notifyStatus: false);
+    });
+  }
+
+  void _emitDrop(DeviceSession session, {DateTime? at}) {
+    _dropCtrl.add(DroppedDevice(
+      device: session.device,
+      mac: session.mac,
+      label: session.patient ?? session.displayName,
+      slot: session.slot,
+      meta: Map<String, dynamic>.from(session.meta),
+      at: at ?? DateTime.now(),
+    ));
   }
 
   BluetoothCharacteristic? _findNotifyChar(
@@ -281,10 +406,15 @@ class BleManager {
   Future<void> disconnect(String mac) async {
     final session = _sessions[mac];
     if (session == null) return;
+    _plannedDisconnects.add(mac); // user asked — never auto re-connect this
     try {
-      await session.device.disconnect();
-    } catch (_) {}
-    await _removeSession(mac);
+      try {
+        await session.device.disconnect();
+      } catch (_) {}
+      await _removeSession(mac);
+    } finally {
+      _plannedDisconnects.remove(mac);
+    }
   }
 
   Future<void> disconnectAll() async {
@@ -390,6 +520,7 @@ class BleManager {
 
   void dispose() {
     _sampleCtrl.close();
+    _dropCtrl.close();
     _scanSub?.cancel();
   }
 }
@@ -405,5 +536,27 @@ class SampleEvent {
     required this.co2,
     required this.rms,
     required this.breath,
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  A device whose link dropped without the app asking (see
+//  BleManager.unplannedDrops). Holds what auto_reconnect.dart needs to bring
+//  the same device back.
+// ══════════════════════════════════════════════════════════════════════════
+class DroppedDevice {
+  final BluetoothDevice device;
+  final String mac;
+  final String label; // patient or display name, for the UI
+  final int slot;
+  final Map<String, dynamic> meta;
+  final DateTime at;
+  const DroppedDevice({
+    required this.device,
+    required this.mac,
+    required this.label,
+    required this.slot,
+    required this.meta,
+    required this.at,
   });
 }

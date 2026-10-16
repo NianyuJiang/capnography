@@ -10,6 +10,7 @@ import 'package:flutter/foundation.dart';
 import 'package:fl_chart/fl_chart.dart' show FlSpot;
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
+import 'device_info.dart';
 import 'device_names.dart';
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -36,6 +37,9 @@ class DeviceSession {
   // ── BLE wiring ──
   BluetoothCharacteristic? notifyChar;
   BluetoothCharacteristic? historyChar; // device's flash-history sync char (null on old firmware)
+  BluetoothCharacteristic? infoChar;    // device-info (health + event log) char; null on old firmware
+  final ValueNotifier<DeviceInfo?> info = ValueNotifier(null);
+  bool isDisposed = false;
   StreamSubscription? notifySub;
   StreamSubscription? stateSub;
 
@@ -206,10 +210,12 @@ class DeviceSession {
   }
 
   Future<void> dispose() async {
+    isDisposed = true;
     stopClock();
     await notifySub?.cancel();
     await stateSub?.cancel();
     elapsedNotifier.dispose();
+    info.dispose();
     tick.dispose();
   }
 }
